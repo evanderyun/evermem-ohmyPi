@@ -87,6 +87,15 @@ const AGENT_DEFS = [
     description: "Alibaba Qwen Code CLI",
     extractScript: "extract-qwen.mjs",
   },
+  {
+    id: "ohmyPi",
+    name: "Oh My Pi",
+    checkDir: join(homedir(), ".omp", "agent", "sessions"),
+    logDir: join(homedir(), ".omp", "agent", "sessions"),
+    logPattern: /\.jsonl$/,
+    description: "Oh My Pi CLI Agent",
+    extractScript: "extract-ohmyPi.mjs",
+  },
 ];
 
 /**
