@@ -8,7 +8,7 @@
  * Filters OUT:
  *   - Non-message entries (model_change, thinking_level_change, etc.)
  *   - Entries with empty text content
- *   - Projects that also exist in ~/.claude/projects/ (avoid dedup)
+ *   - Duplicate sessions (same timestamp range as Claude Code — overlap dedup)
  *
  * Usage:
  *   node extract-ohmyPi.mjs --since <ISO> [--recent N] [--dry-run] [--output json]
@@ -127,13 +127,15 @@ async function extractSession(filePath) {
 // actual timestamp overlap, not just project directory existence.
 
 /**
- * Get the time range [start, end] ms from a JSONL session file by reading
+ * Get the time range {start, end} ms from a JSONL session file by reading
  * ALL entry timestamps (header, messages, model changes, etc.).
+ * Returns null if the file cannot be read or contains no timestamps.
  */
 async function getSessionTimeRange(filePath) {
   let minTs = Infinity, maxTs = -Infinity;
+  let skipCount = 0;
   try {
-    const rl = createInterface({ input: createReadStream(filePath), crlfDelay: Infinity });
+    const rl = createInterface({ input: createReadStream(filePath, { encoding: "utf-8" }), crlfDelay: Infinity });
     for await (const line of rl) {
       try {
         const entry = JSON.parse(line);
@@ -142,10 +144,16 @@ async function getSessionTimeRange(filePath) {
           if (ts < minTs) minTs = ts;
           if (ts > maxTs) maxTs = ts;
         }
-      } catch {/* skip parse errors */}
+      } catch {
+        skipCount++;
+      }
     }
-  } catch {
+  } catch (err) {
+    console.error(`[dedup] Warning: cannot read ${filePath}: ${err.message}`);
     return null;
+  }
+  if (skipCount > 0) {
+    console.error(`[dedup] Warning: skipped ${skipCount} malformed line(s) in ${filePath}`);
   }
   if (minTs === Infinity) return null;
   return { start: minTs, end: maxTs };
@@ -158,14 +166,15 @@ async function getClaudeSessionRanges(claudeDir) {
   const fullPath = join(CLAUDE_PROJECTS_DIR, claudeDir);
   try {
     const files = await readdir(fullPath);
-    const jsonlFiles = files.filter((f) => f.endsWith(".jsonl") && !f.includes("/"));
+    const jsonlFiles = files.filter((f) => f.endsWith(".jsonl"));
     const ranges = [];
     for (const f of jsonlFiles) {
       const range = await getSessionTimeRange(join(fullPath, f));
       if (range) ranges.push(range);
     }
     return ranges;
-  } catch {
+  } catch (err) {
+    console.error(`[dedup] Warning: cannot read Claude Code sessions from ${fullPath}: ${err.message}`);
     return [];
   }
 }
@@ -222,7 +231,7 @@ async function getRecentSessions(n) {
   // Dedup: skip Oh My Pi sessions whose time range overlaps with Claude Code
   // Only applies in scheduled/batch mode (sinceTime set) to avoid re-scanning
   // all Claude Code sessions on every --recent-only invocation.
-  const dedupFiltered = sinceTime > 0 ? [] : filtered;
+  const candidates = sinceTime > 0 ? [] : filtered;
   if (sinceTime > 0) {
     const claudeCache = new Map();  // claudeDir → array of { start, end }
     for (const s of filtered) {
@@ -246,11 +255,11 @@ async function getRecentSessions(n) {
           }
         }
       }
-      dedupFiltered.push(s);
+      candidates.push(s);
     }
   }
-  dedupFiltered.sort((a, b) => b.mtime - a.mtime);
-  return dedupFiltered.slice(0, n);
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  return candidates.slice(0, n);
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
