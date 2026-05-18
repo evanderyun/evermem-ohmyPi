@@ -121,36 +121,62 @@ async function extractSession(filePath) {
   return { agent: "ohmyPi", sessionId, filePath, turns };
 }
 
-// ── Dedup: skip projects covered by Claude Code ──────────────────────────────
+// ── Dedup: skip sessions that overlap with Claude Code ───────────────────
+// If the same conversation is recorded by both Oh My Pi and Claude Code (since
+// OMP wraps Claude Code binary), only keep one copy. Detection is based on
+// actual timestamp overlap, not just project directory existence.
 
-async function claudeProjectDirExists(cwd) {
-  if (!cwd) return false;
-  const claudeDir = cwd.replace(/\/+/g, "-");
-  const fullPath = join(CLAUDE_PROJECTS_DIR, claudeDir);
+/**
+ * Get the time range [start, end] ms from a JSONL session file by reading
+ * ALL entry timestamps (header, messages, model changes, etc.).
+ */
+async function getSessionTimeRange(filePath) {
+  let minTs = Infinity, maxTs = -Infinity;
   try {
-    await access(fullPath);
-    return true;
+    const rl = createInterface({ input: createReadStream(filePath), crlfDelay: Infinity });
+    for await (const line of rl) {
+      try {
+        const entry = JSON.parse(line);
+        const ts = entry.timestamp ? new Date(entry.timestamp).getTime() : null;
+        if (ts && !isNaN(ts)) {
+          if (ts < minTs) minTs = ts;
+          if (ts > maxTs) maxTs = ts;
+        }
+      } catch {/* skip parse errors */}
+    }
   } catch {
-    return false;
+    return null;
   }
+  if (minTs === Infinity) return null;
+  return { start: minTs, end: maxTs };
 }
 
-async function claudeHasRecentSessions(cwd, sinceTime) {
-  if (!cwd) return false;
-  const claudeDir = cwd.replace(/\/+/g, "-");
+/**
+ * Get all session time ranges from Claude Code for a given project directory.
+ */
+async function getClaudeSessionRanges(claudeDir) {
   const fullPath = join(CLAUDE_PROJECTS_DIR, claudeDir);
   try {
     const files = await readdir(fullPath);
-    const jsonlFiles = files.filter((f) => f.endsWith(".jsonl"));
+    const jsonlFiles = files.filter((f) => f.endsWith(".jsonl") && !f.includes("/"));
+    const ranges = [];
     for (const f of jsonlFiles) {
-      const s = await stat(join(fullPath, f));
-      if (s.mtime.getTime() > sinceTime) return true;
+      const range = await getSessionTimeRange(join(fullPath, f));
+      if (range) ranges.push(range);
     }
-    return false;
+    return ranges;
   } catch {
-    return false;
+    return [];
   }
 }
+
+/**
+ * Check if two time ranges [aStart, aEnd] and [bStart, bEnd] overlap.
+ */
+function rangesOverlap(aStart, aEnd, bStart, bEnd) {
+  return aStart <= bEnd && bStart <= aEnd;
+}
+
 
 // ── Session Discovery ────────────────────────────────────────────────────────
 
@@ -174,7 +200,6 @@ async function listSessionFiles(projectDir) {
       const fullPath = join(fullDir, f);
       try {
         const s = await stat(fullPath);
-        // Read session header to get cwd for dedup
         const header = await readSessionHeader(fullPath);
         return { path: fullPath, mtime: s.mtime.getTime(), size: s.size, cwd: header?.cwd ?? null };
       } catch { return null; }
@@ -190,16 +215,36 @@ async function getRecentSessions(n) {
     const sessions = await listSessionFiles(dir);
     all.push(...sessions);
   }
+
   // Apply sinceTime filter
   let filtered = sinceTime > 0 ? all.filter((s) => s.mtime > sinceTime) : all;
 
-  // Dedup: skip projects where Claude Code has MORE RECENT sessions
-  // Only applies when sinceTime is set (batch mode, not --recent mode)
+  // Dedup: skip Oh My Pi sessions whose time range overlaps with Claude Code
+  // Only applies in scheduled/batch mode (sinceTime set) to avoid re-scanning
+  // all Claude Code sessions on every --recent-only invocation.
   const dedupFiltered = sinceTime > 0 ? [] : filtered;
   if (sinceTime > 0) {
+    const claudeCache = new Map();  // claudeDir → array of { start, end }
     for (const s of filtered) {
-      if (s.cwd && await claudeHasRecentSessions(s.cwd, sinceTime)) {
-        continue; // Claude Code covers this
+      if (s.cwd) {
+        const claudeDir = s.cwd.replace(/\/+/g, "-");
+        if (!claudeCache.has(claudeDir)) {
+          claudeCache.set(claudeDir, await getClaudeSessionRanges(claudeDir));
+        }
+        const cRanges = claudeCache.get(claudeDir);
+        if (cRanges.length > 0) {
+          const ompRange = await getSessionTimeRange(s.path);
+          if (ompRange) {
+            let isDuplicate = false;
+            for (const cr of cRanges) {
+              if (rangesOverlap(ompRange.start, ompRange.end, cr.start, cr.end)) {
+                isDuplicate = true;
+                break;
+              }
+            }
+            if (isDuplicate) continue;
+          }
+        }
       }
       dedupFiltered.push(s);
     }
